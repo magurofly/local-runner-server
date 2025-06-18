@@ -1,9 +1,10 @@
-use std::{collections::HashMap, env::{current_dir, set_current_dir}, fs::File, io::Read, path::Path, process::{Command, ExitStatus, Stdio}, sync::OnceLock};
+use std::{collections::HashMap, fs::File, io::Read, path::Path, process::{Command, ExitStatus, Stdio}, sync::{Mutex, OnceLock}, time::Duration};
 
 use actix_cors::Cors;
 use actix_web::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 #[allow(non_snake_case)]
 #[derive(Deserialize)]
@@ -64,6 +65,8 @@ fn error_body(err: &str, msg: &str) -> HttpResponse {
     json_response(map)
 }
 
+static COMPILE_MUTEX: Mutex<()> = Mutex::new(());
+
 #[post("/")]
 async fn api(req: web::Json<Req>) -> impl Responder {
     match req.mode.as_str() {
@@ -80,14 +83,19 @@ async fn api(req: web::Json<Req>) -> impl Responder {
             let Some(source_code) = &req.sourceCode else { return error_body("internalError", "sourceCode not given") };
             let stdin = req.stdin.as_ref().map(String::as_str).unwrap_or("");
 
-            let program_id = match compile(compiler_name, source_code).await {
-                Ok(program_id) => program_id,
-                Err(msg) => return error_body("compileError", &format!("{:?}", msg)),
+            let program_id = {
+                let lock = COMPILE_MUTEX.lock().unwrap();
+                let program_id = match compile(compiler_name, source_code).await {
+                    Ok(program_id) => program_id,
+                    Err(msg) => return error_body("compileError", &format!("{:?}\n{:?}", msg, msg.source())),
+                };
+                drop(lock);
+                program_id
             };
 
             let result = match run(compiler_name, &program_id, stdin).await {
                 Ok(result) => result,
-                Err(msg) => return error_body("internalError", &format!("{:?}", msg)),
+                Err(msg) => return error_body("internalError", &format!("{:?}\n{:?}", msg, msg.source())),
             };
 
             json_response(&result)
@@ -98,22 +106,28 @@ async fn api(req: web::Json<Req>) -> impl Responder {
     }
 }
 
-fn cd_temporary<T>(path: impl AsRef<Path>, f: impl FnOnce() -> T) -> T {
-    let orig_dir = current_dir().unwrap();
-    set_current_dir(path).unwrap();
-    let x = f();
-    set_current_dir(orig_dir).unwrap();
-    x
-}
-
 async fn compile(compiler_name: &str, source_code: &str) -> Result<String, Box<dyn std::error::Error>> {
     let Some(compiler) = CONFIG.get().unwrap().compilers.get(compiler_name) else { return Err("undefined compilerName".into()) };
 
-    let program_id = hex::encode(Sha256::digest(source_code));
+    let program_id = format!("{compiler_name}-{}", hex::encode(Sha256::digest(source_code)));
     let dir = Path::new("program").join(&program_id);
 
-    if std::fs::exists(&dir)? {
-        //TODO: when collision occurs
+    if std::fs::exists(&dir).unwrap() {
+        // コンパイルが完了するまで待つ
+        actix_web::rt::time::sleep(Duration::from_millis(100)).await;
+        while !std::fs::exists(dir.join("compile_status.txt"))? {
+            actix_web::rt::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let mut status = String::new();
+        File::open(dir.join("compile_status.txt"))?.read_to_string(&mut status)?;
+        let status = status.parse::<i32>()?;
+        if status != 0 {
+            let mut compile_error = String::new();
+            File::open(dir.join("compile_error.txt"))?.read_to_string(&mut compile_error)?;
+            return Err(compile_error.into());   
+        }
+
         return Ok(program_id);
     }
 
@@ -136,63 +150,75 @@ async fn compile(compiler_name: &str, source_code: &str) -> Result<String, Box<d
     let source_path = dir.join(&compiler.source_filename);
     std::fs::write(source_path, source_code)?;
 
-    cd_temporary(&dir, || {
-        let mut compile_command = Command::new(&compiler.compile_command[0]);
-        compile_command.args(&compiler.compile_command[1 ..]);
-        compile_command.stderr(Stdio::from(File::create_new("compile_error.txt")?));
+    let mut compile_command = Command::new(&compiler.compile_command[0]);
+    compile_command.args(&compiler.compile_command[1 ..]);
+    compile_command.stderr(Stdio::from(File::create(dir.join("compile_error.txt"))?));
+    compile_command.current_dir(&dir);
 
-        let status = compile_command.status()?;
-        if status.code() != Some(0) {
-            let mut compile_error = String::new();
-            File::open("compile_error.txt")?.read_to_string(&mut compile_error)?;
-            return Err(compile_error.into());
-        }
+    let status = compile_command.status()?.code().unwrap();
+    std::fs::write(dir.join("compile_status.txt"), status.to_string())?;
 
-        Ok(program_id)
-    })
+    if status != 0 {
+        let mut compile_error = String::new();
+        File::open(dir.join("compile_error.txt"))?.read_to_string(&mut compile_error)?;
+        return Err(compile_error.into());
+    }
+
+    Ok(program_id)
 }
 
 async fn run(compiler_name: &str, program_id: &str, stdin: &str) -> Result<RunResult, Box<dyn std::error::Error>> {
+    let dir = Path::new("program").join(&program_id);
+    
     let compiler = CONFIG.get().unwrap().compilers.get(compiler_name).unwrap();
 
-    let dir = Path::new("program").join(&program_id);
-    cd_temporary(&dir, || {
-        std::fs::write("stdin.txt", stdin)?;
+    let prefix = format!("{}", Uuid::new_v4());
+    let stdin_filename = format!("{prefix}-stdin.txt");
+    let stdout_filename = format!("{prefix}-stdout.txt");
+    let stderr_filename = format!("{prefix}-stderr.txt");
+    let time_filename = format!("{prefix}-time.txt");
+    
+    std::fs::write(dir.join(&stdin_filename), stdin)?;
 
-        let mut run_command = Command::new("time");
-        run_command.args(["-q", "-f", "%e %M", "-o", "time.txt"]);
-        run_command.args(&compiler.run_command);
-        run_command.stdin(Stdio::from(File::open("stdin.txt")?));
-        run_command.stdout(Stdio::from(File::create("stdout.txt")?));
-        run_command.stderr(Stdio::from(File::create("stderr.txt")?));
+    let mut run_command = Command::new("time");
+    run_command.args(["-q", "-f", "%e %M", "-o", &time_filename]);
+    run_command.args(&compiler.run_command);
+    run_command.stdin(Stdio::from(File::open(dir.join(&stdin_filename))?));
+    run_command.stdout(Stdio::from(File::create(dir.join(&stdout_filename))?));
+    run_command.stderr(Stdio::from(File::create(dir.join(&stderr_filename))?));
+    run_command.current_dir(&dir);
 
-        let status = run_command.status()?;
+    let status = run_command.status()?;
 
-        let (time, memory) = {
-            let mut time_memory = String::new();
-            File::open("time.txt")?.read_to_string(&mut time_memory)?;
-            let mut it = time_memory.split_ascii_whitespace();
-            let time = it.next().unwrap().parse::<f64>()? * 1E+3;
-            let memory = it.next().unwrap().parse::<f64>()?;
-            (time, memory)
-        };
+    let (time, memory) = {
+        let mut time_memory = String::new();
+        File::open(dir.join(&time_filename))?.read_to_string(&mut time_memory)?;
+        let mut it = time_memory.split_ascii_whitespace();
+        let time = it.next().unwrap().parse::<f64>()? * 1E+3;
+        let memory = it.next().unwrap().parse::<f64>()?;
+        (time, memory)
+    };
 
-        let mut stdout = String::new();
-        File::open("stdout.txt")?.read_to_string(&mut stdout)?;
+    let mut stdout = String::new();
+    File::open(dir.join(&stdout_filename))?.read_to_string(&mut stdout)?;
 
-        let mut stderr = String::new();
-        File::open("stderr.txt")?.read_to_string(&mut stderr)?;
+    let mut stderr = String::new();
+    File::open(dir.join(&stderr_filename))?.read_to_string(&mut stderr)?;
 
-        let exit_code = status.code().unwrap();
+    let exit_code = status.code().unwrap();
 
-        Ok(RunResult {
-            status: "success",
-            stdout: Some(stdout),
-            stderr: Some(stderr),
-            exit_code: Some(exit_code),
-            memory: Some(memory),
-            time: Some(time),
-        })
+    std::fs::remove_file(dir.join(&stdin_filename))?;
+    std::fs::remove_file(dir.join(&stdout_filename))?;
+    std::fs::remove_file(dir.join(&stderr_filename))?;
+    std::fs::remove_file(dir.join(&time_filename))?;
+
+    Ok(RunResult {
+        status: "success",
+        stdout: Some(stdout),
+        stderr: Some(stderr),
+        exit_code: Some(exit_code),
+        memory: Some(memory),
+        time: Some(time),
     })
 }
 

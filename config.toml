@@ -7,7 +7,7 @@ copy_files = [
     ["rust/Cargo.toml", "Cargo.toml"],
 ]
 source_filename = "src/main.rs"
-compile_command = ["cargo", "build", "--release", "--quiet", "--offline"]
+compile_command = ["cargo", "build", "--release", "--quiet"]
 run_command = ["./target/release/main"]
 
 [compilers.ruby]
