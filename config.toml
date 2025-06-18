@@ -1,0 +1,19 @@
+bind = "localhost:49139"
+
+[compilers.rust]
+language = "Rust"
+label = "Rust"
+copy_files = [
+    ["rust/Cargo.toml", "Cargo.toml"],
+]
+source_filename = "src/main.rs"
+compile_command = ["cargo", "build", "--release", "--quiet", "--offline"]
+run_command = ["./target/release/main"]
+
+[compilers.ruby]
+language = "Ruby"
+label = "Ruby"
+copy_files = []
+source_filename = "Main.rb"
+compile_command = ["ruby", "-c", "Main.rb"]
+run_command = ["ruby", "Main.rb"]
