@@ -228,6 +228,8 @@ async fn main() -> std::io::Result<()> {
     let config = toml::from_str::<Config>(&std::fs::read_to_string("config.toml")?).unwrap();
     CONFIG.get_or_init(|| config );
 
+    println!("http://{}", &CONFIG.get().unwrap().bind);
+
     HttpServer::new(|| {
         App::new()
             .wrap(

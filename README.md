@@ -31,3 +31,19 @@ compile_command = ["cargo", "build", "--release", "--quiet"]
 # 実行コマンド
 run_command = ["./target/release/main"]
 ```
+
+### 2. サーバーを起動する
+Rust が入っていなければ Rust をインストールする。
+
+以下のコマンドを実行すると、 URL が表示されるのでコピーする。
+
+```sh
+$ cargo run
+```
+
+### 3. AtCoder Easy Test v2 で設定する
+1. 適当な問題ページを開く。
+2. 画面下部の「＾」を押し、右下にある「Setting」ボタンを押す。設定画面が出る。
+3. `codeRunner.localRunnerURL` の左にあるテキストボックスに `2.` でコピーした URL を貼り付ける。
+4. 設定画面を閉じ、問題ページをリロードする。
+5. 使いたい言語を選択した状態で画面下部の「＾」を押し、 Environment のプルダウンを開くと `1.` で設定した環境が選択できる。
