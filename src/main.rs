@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs::File, io::Read, path::Path, process::{Command, ExitStatus, Stdio}, sync::{Mutex, OnceLock}, time::Duration};
+use std::{collections::HashMap, fs::File, io::Read, path::Path, process::{Command, Stdio}, sync::{Mutex, OnceLock}, time::Duration};
 
 use actix_cors::Cors;
 use actix_web::*;
@@ -29,7 +29,7 @@ struct RunResult {
     status: &'static str,
     stdout: Option<String>,
     stderr: Option<String>,
-    exit_code: Option<i32>,
+    exitCode: Option<i32>,
     time: Option<f64>,
     memory: Option<f64>,
 }
@@ -54,7 +54,7 @@ static CONFIG: OnceLock<Config> = OnceLock::new();
 
 fn json_response(data: impl Serialize) -> HttpResponse {
     HttpResponse::Ok()
-        .append_header(("Content-Type", "application/json"))
+        .append_header(("Content-Type", "application/json; charset=UTF-8"))
         .body(serde_json::to_string(&data).unwrap())
 }
 
@@ -64,8 +64,6 @@ fn error_body(err: &str, msg: &str) -> HttpResponse {
     map.insert("stderr", msg);
     json_response(map)
 }
-
-static COMPILE_MUTEX: Mutex<()> = Mutex::new(());
 
 #[post("/")]
 async fn api(req: web::Json<Req>) -> impl Responder {
@@ -83,14 +81,9 @@ async fn api(req: web::Json<Req>) -> impl Responder {
             let Some(source_code) = &req.sourceCode else { return error_body("internalError", "sourceCode not given") };
             let stdin = req.stdin.as_ref().map(String::as_str).unwrap_or("");
 
-            let program_id = {
-                let lock = COMPILE_MUTEX.lock().unwrap();
-                let program_id = match compile(compiler_name, source_code).await {
-                    Ok(program_id) => program_id,
-                    Err(msg) => return error_body("compileError", &format!("{:?}\n{:?}", msg, msg.source())),
-                };
-                drop(lock);
-                program_id
+            let program_id = match compile(compiler_name, source_code).await {
+                Ok(program_id) => program_id,
+                Err(msg) => return error_body("compileError", &format!("{:?}\n{:?}", msg, msg.source())),
             };
 
             let result = match run(compiler_name, &program_id, stdin).await {
@@ -107,12 +100,22 @@ async fn api(req: web::Json<Req>) -> impl Responder {
 }
 
 async fn compile(compiler_name: &str, source_code: &str) -> Result<String, Box<dyn std::error::Error>> {
+    static MUTEX_TO_AVOID_TOCTOU: Mutex<()> = Mutex::new(());
+
     let Some(compiler) = CONFIG.get().unwrap().compilers.get(compiler_name) else { return Err("undefined compilerName".into()) };
 
     let program_id = format!("{compiler_name}-{}", hex::encode(Sha256::digest(source_code)));
     let dir = Path::new("program").join(&program_id);
 
-    if std::fs::exists(&dir).unwrap() {
+    let already_compiled = {
+        let lock = MUTEX_TO_AVOID_TOCTOU.lock()?;
+        let exists = std::fs::exists(&dir)?;
+        std::fs::create_dir_all(&dir)?;
+        drop(lock);
+        exists
+    };
+
+    if already_compiled {
         // コンパイルが完了するまで待つ
         actix_web::rt::time::sleep(Duration::from_millis(100)).await;
         while !std::fs::exists(dir.join("compile_status.txt"))? {
@@ -130,8 +133,6 @@ async fn compile(compiler_name: &str, source_code: &str) -> Result<String, Box<d
 
         return Ok(program_id);
     }
-
-    std::fs::create_dir(&dir)?;
 
     for (src, dst) in &compiler.copy_files {
         if let Some(parent) = Path::new(dst).parent() {
@@ -216,7 +217,7 @@ async fn run(compiler_name: &str, program_id: &str, stdin: &str) -> Result<RunRe
         status: "success",
         stdout: Some(stdout),
         stderr: Some(stderr),
-        exit_code: Some(exit_code),
+        exitCode: Some(exit_code),
         memory: Some(memory),
         time: Some(time),
     })
