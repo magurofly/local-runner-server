@@ -83,12 +83,12 @@ async fn api(req: web::Json<Req>) -> impl Responder {
 
             let program_id = match compile(compiler_name, source_code).await {
                 Ok(program_id) => program_id,
-                Err(msg) => return error_body("compileError", &format!("{:?}\n{:?}", msg, msg.source())),
+                Err(msg) => return error_body("compileError", &msg.to_string()),
             };
 
             let result = match run(compiler_name, &program_id, stdin).await {
                 Ok(result) => result,
-                Err(msg) => return error_body("internalError", &format!("{:?}\n{:?}", msg, msg.source())),
+                Err(msg) => return error_body("internalError", &msg.to_string()),
             };
 
             json_response(&result)
